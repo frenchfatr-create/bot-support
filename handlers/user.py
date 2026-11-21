@@ -1,95 +1,170 @@
-from aiogram import Router, F
+from html import escape
+
+from aiogram import Router
 from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery
-from database.queries import upsert_user, is_banned, list_user_tickets, get_ticket
-from keyboards.user import main_menu, ticket_rating
-from services.tickets import create_ticket
+from aiogram.types import Message
+
 from config import OWNER_IDS, ADMIN_IDS
+from database.queries import (
+    get_stats, add_admin, remove_admin, set_banned,
+    get_database_admin_ids, get_admin_queue, save_admin_card,
+    get_banned_users,
+)
+from keyboards.admin import new_ticket_card
 
 router = Router()
 
-class UserFlow(StatesGroup):
-    waiting_ticket = State()
 
-@router.callback_query(F.data == "new_ticket")
-async def new_ticket(call: CallbackQuery, state: FSMContext):
-    if await is_banned(call.from_user.id):
-        await call.answer("Доступ ограничен.", show_alert=True)
-        return
-    await state.set_state(UserFlow.waiting_ticket)
-    await call.message.answer("Опишите проблему одним сообщением. Можно прикрепить фото или документ.")
-    await call.answer()
+async def is_admin(user_id: int) -> bool:
+    return (
+        user_id in OWNER_IDS
+        or user_id in ADMIN_IDS
+        or user_id in await get_database_admin_ids()
+    )
 
-@router.message(UserFlow.waiting_ticket)
-async def submit_ticket(message: Message, state: FSMContext):
-    if await is_banned(message.from_user.id):
-        await state.clear()
-        await message.answer("Доступ к поддержке ограничен.")
+
+def is_owner(user_id: int) -> bool:
+    return user_id in OWNER_IDS
+
+
+@router.message(Command("adminhelp"))
+async def admin_help(message: Message):
+    if not await is_admin(message.from_user.id):
         return
-    if not (message.text or message.caption or message.photo or message.document):
-        await message.answer("Пожалуйста, отправьте текст, фотографию или документ.")
-        return
-    ticket_id = await create_ticket(message)
-    await state.clear()
     await message.answer(
-        f"Обращение №{ticket_id} создано. Специалисты получили уведомление. Пожалуйста, ожидайте ответа.",
-        reply_markup=main_menu()
+        "<b>Команды администрации</b>\n\n"
+        "<b>Для всех администраторов:</b>\n"
+        "/admin — панель поддержки\n"
+        "/queue — новые обращения\n"
+        "/stats — статистика\n"
+        "/adminhelp — список команд\n\n"
+        "<b>Только для главного администратора:</b>\n"
+        "/addadmin ID — добавить администратора\n"
+        "/deladmin ID — удалить администратора\n"
+        "/ban ID — заблокировать пользователя\n"
+        "/unban ID — снять блокировку\n"
+        "/bans — список заблокированных пользователей"
     )
 
-@router.callback_query(F.data == "my_tickets")
-async def my_tickets(call: CallbackQuery):
-    rows = await list_user_tickets(call.from_user.id)
-    if not rows:
-        await call.message.answer("У вас пока нет обращений.")
-    else:
-        lines = ["<b>Ваши обращения:</b>"]
-        for t in rows:
-            lines.append(f"№{t['id']} — {t['status_label']}")
-        await call.message.answer("\n".join(lines))
-    await call.answer()
 
-@router.message(Command("mytickets"))
-async def my_tickets_command(message: Message):
-    rows = await list_user_tickets(message.from_user.id)
-    if not rows:
-        await message.answer("У вас пока нет обращений.")
+@router.message(Command("admin"))
+async def admin_panel(message: Message):
+    if not await is_admin(message.from_user.id):
         return
-    await message.answer("\n".join(f"№{t['id']} — {t['status_label']}" for t in rows))
-
-@router.callback_query(F.data == "faq")
-async def faq_callback(call: CallbackQuery):
-    await call.message.answer(
-        "<b>Частые вопросы</b>\n"
-        "1. Как обратиться в поддержку? Нажмите «Написать в поддержку».\n"
-        "2. Как узнать статус? Откройте «Мои обращения».\n"
-        "3. Можно ли отправить файл? Да, поддерживаются фотографии и документы."
-    )
-    await call.answer()
-
-@router.message(Command("faq"))
-async def faq(message: Message):
+    stats = await get_stats()
     await message.answer(
-        "<b>Частые вопросы</b>\n"
-        "1. Как обратиться в поддержку? Нажмите «Написать в поддержку».\n"
-        "2. Как узнать статус? Откройте «Мои обращения».\n"
-        "3. Можно ли отправить файл? Да, поддерживаются фотографии и документы."
+        "<b>Панель поддержки</b>\n"
+        f"Новые: {stats['new']}\nВ работе: {stats['open']}\nЗакрыто: {stats['closed']}\n"
+        "Команды: /adminhelp, /queue, /stats"
     )
 
-@router.callback_query(F.data.startswith("rate:"))
-async def rate_ticket(call: CallbackQuery):
-    try:
-        _, ticket_id, score = call.data.split(":")
-        ticket_id, score = int(ticket_id), int(score)
-    except ValueError:
-        await call.answer("Некорректная оценка.", show_alert=True)
+
+@router.message(Command("queue"))
+async def queue(message: Message):
+    if not await is_admin(message.from_user.id):
         return
-    ticket = await get_ticket(ticket_id)
-    if not ticket or ticket["user_id"] != call.from_user.id or ticket["status"] != "closed":
-        await call.answer("Оценить это обращение нельзя.", show_alert=True)
+    rows = await get_admin_queue()
+    if not rows:
+        await message.answer("Новых обращений нет.")
         return
-    from database.queries import save_rating
-    await save_rating(ticket_id, call.from_user.id, score)
-    await call.message.edit_text("Спасибо за вашу оценку!")
-    await call.answer()
+    for ticket in rows:
+        sent = await message.answer(
+            f"<b>Обращение №{ticket['id']}</b>\n"
+            f"Пользователь: <code>{ticket['user_id']}</code>\n"
+            f"{escape(ticket['preview'] or 'Вложение или сообщение')}",
+            reply_markup=new_ticket_card(ticket["id"]),
+        )
+        await save_admin_card(
+            ticket["id"], message.from_user.id, message.chat.id, sent.message_id
+        )
+
+
+@router.message(Command("stats"))
+async def stats(message: Message):
+    if not await is_admin(message.from_user.id):
+        return
+    data = await get_stats()
+    await message.answer(
+        "<b>Статистика</b>\n"
+        f"Новые: {data['new']}\n"
+        f"В работе: {data['open']}\n"
+        f"Закрыто: {data['closed']}\n"
+        f"Средняя оценка: {data['avg_rating'] or 'пока нет оценок'}"
+    )
+
+
+@router.message(Command("addadmin"))
+async def addadmin(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /addadmin TELEGRAM_ID")
+        return
+    user_id = int(parts[1])
+    if user_id in OWNER_IDS:
+        await message.answer("Этот пользователь уже является главным администратором.")
+        return
+    await add_admin(user_id)
+    await message.answer(f"Администратор {user_id} добавлен.")
+
+
+@router.message(Command("deladmin"))
+async def deladmin(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /deladmin TELEGRAM_ID")
+        return
+    user_id = int(parts[1])
+    await remove_admin(user_id)
+    await message.answer(f"Администратор {user_id} удалён из списка.")
+
+
+@router.message(Command("ban"))
+async def ban(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /ban TELEGRAM_ID")
+        return
+    user_id = int(parts[1])
+    db_admins = await get_database_admin_ids()
+    if user_id in OWNER_IDS or user_id in ADMIN_IDS or user_id in db_admins:
+        await message.answer("Нельзя заблокировать администратора.")
+        return
+    await set_banned(user_id, True)
+    await message.answer(f"Пользователь {user_id} добавлен в чёрный список.")
+
+
+@router.message(Command("unban"))
+async def unban(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /unban TELEGRAM_ID")
+        return
+    user_id = int(parts[1])
+    await set_banned(user_id, False)
+    await message.answer(f"Пользователь {user_id} удалён из чёрного списка.")
+
+
+@router.message(Command("bans"))
+async def bans(message: Message):
+    if not is_owner(message.from_user.id):
+        return
+    users = await get_banned_users()
+    if not users:
+        await message.answer("Чёрный список пуст.")
+        return
+    lines = ["<b>Чёрный список</b>"]
+    for item in users[:100]:
+        lines.append(
+            f"• <code>{item['user_id']}</code> — {escape(str(item['created_at']))}"
+        )
+    if len(users) > 100:
+        lines.append(f"\nПоказаны первые 100 из {len(users)}.")
+    await message.answer("\n".join(lines))
