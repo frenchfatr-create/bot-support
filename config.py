@@ -1,5 +1,6 @@
 import os
 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_IDS = {
     int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x
 }
