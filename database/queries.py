@@ -137,3 +137,15 @@ async def get_database_admin_ids():
     async with connect() as db:
         cur = await db.execute("SELECT user_id FROM admins")
         return {row[0] for row in await cur.fetchall()}
+
+
+
+async def get_banned_users():
+    async with connect() as db:
+        cur = await db.execute(
+            "SELECT user_id, created_at FROM blacklist ORDER BY created_at DESC"
+        )
+        return [
+            {"user_id": row[0], "created_at": row[1]}
+            for row in await cur.fetchall()
+        ]
